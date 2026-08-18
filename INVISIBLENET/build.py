@@ -16,14 +16,27 @@ LastUpdated всегда растёт: Happ игнорирует профиль,
 в geosite.dat/geoip.dat по тем URL, на которые сам профиль и ссылается. Если
 upstream уедет на категорию, которой в файлах нет, — Xray у клиента не стартует
 вообще, поэтому здесь скрипт падает и битое до панели не доезжает.
+
+Публикуем НЕ каждый раз, когда шевельнулся upstream. В теге Geoipurl зашита дата,
+и roscomvpn-geoip выкладывает новый тег ЕЖЕДНЕВНО, тогда как сами правила и
+geosite заморожены с апреля. Каждая публикация заставляет Happ переимпортировать
+профиль, а в зазоре «правила применены — geo ещё качаются» ядро Xray не стартует
+и клиент видит «не найдена категория torrent»: четырёх секций (torrent, whitelist,
+twitch-ads, geoip:direct) нет в базовой Loyalsoldier, с которой Happ живёт до
+докачки roscomvpn. То есть окно отказа повторялось каждый день на ровном месте.
+Поэтому: если относительно прошлой публикации изменился ТОЛЬКО тег geoip —
+пропускаем, пока закреплённой базе не исполнится GEOIP_MAX_AGE_DAYS. Устаревший
+на месяц geoip безвреден: это списки IP РФ, они дрейфуют медленно и ядро не роняют.
 """
 
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
+from datetime import datetime, timezone
 
 UPSTREAM = ("https://raw.githubusercontent.com/hydraponique/roscomvpn-routing"
             "/main/HAPP/DEFAULT.DEEPLINK")
@@ -33,6 +46,11 @@ OUR_NAME = "Invisible Net RU-Direct"
 
 # Поля, расхождение по которым не считается изменением содержимого.
 VOLATILE = {"Name", "LastUpdated"}
+
+# Сколько дней держим закреплённый geoip, пока upstream ежедневно выкладывает
+# новый тег. Обновимся, когда базе станет столько дней — либо раньше, если
+# в профиле изменится что-то кроме этого тега.
+GEOIP_MAX_AGE_DAYS = 30
 
 
 def fetch(url, binary=False):
@@ -93,6 +111,21 @@ def sections(blob):
     return found
 
 
+def geoip_age_days(url):
+    """Возраст закреплённой geoip-базы в днях по тегу вида @202608180355.
+
+    Возвращает None, если тег непривычной формы — тогда решение о пропуске
+    публикации не принимаем и ведём себя как раньше (публикуем)."""
+    match = re.search(r"geoip@(\d{12})\b", url or "")
+    if not match:
+        return None
+    try:
+        stamp = datetime.strptime(match.group(1), "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - stamp).days
+
+
 def validate(profile):
     if profile.get("Name") != OUR_NAME:
         raise SystemExit(f"Name не наш: {profile.get('Name')!r}")
@@ -142,6 +175,19 @@ def main():
         if a == b:
             print("содержимое upstream не изменилось — коммитить нечего")
             return 0
+
+        # Единственное расхождение — ежедневный тег geoip? Такая публикация не
+        # несёт клиенту ничего, кроме переимпорта профиля и окна, в котором ядро
+        # не стартует. Держим закреплённую базу, пока она не состарится.
+        if ({k: v for k, v in a.items() if k != "Geoipurl"}
+                == {k: v for k, v in b.items() if k != "Geoipurl"}):
+            age = geoip_age_days(previous.get("Geoipurl"))
+            if age is not None and age < GEOIP_MAX_AGE_DAYS:
+                print(f"изменился только тег geoip; закреплённой базе {age} дн. "
+                      f"(лимит {GEOIP_MAX_AGE_DAYS}) — публиковать нечего")
+                return 0
+            print(f"изменился только тег geoip, базе {age} дн. — пора обновить")
+
         changed = sorted(set(a) ^ set(b)) or sorted(k for k in a if a[k] != b.get(k))
         print("изменилось:", ", ".join(changed))
 
